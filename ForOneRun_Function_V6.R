@@ -1,0 +1,169 @@
+##########################################################################################
+#update ban_list
+BanModel <- function(BanList, banInd){
+  if(missing(BanList)){
+    BanList <- NULL
+  }
+  BanList <- c(BanList,paste(banInd,collapse=""))
+  return(BanList)
+}
+
+
+###########################################################################################
+########################pheromone calculation##############################################
+###########################################################################################
+ModelEst <- function(Model, Data, Fit){
+  options(warn = 2)
+  fit_cfa <-
+    try(lavaan(
+      Model$CFAModel,
+      data = Data,
+      auto.var = TRUE,
+      auto.fix.first = FALSE,
+      std.lv = TRUE,
+      auto.cov.lv.x = TRUE
+    ),
+    silent = TRUE)
+  Fit_In <- c("srmr","rmsea","ifi","tli","cfi","mfi")
+  Fit1 <- try(fitMeasures(fit_cfa, Fit_In[Fit[1]]), silent = TRUE)
+  Fit2 <- try(fitMeasures(fit_cfa, Fit_In[Fit[2]]), silent = TRUE)
+  Fit3 <- try(fitMeasures(fit_cfa, Fit_In[Fit[3]]), silent = TRUE)
+  bic <- try(BIC(fit_cfa), silent = TRUE)
+  Fits <- cbind(Fit1, Fit2, Fit3)  
+  
+  if (class(Fit1)[1] == "try-error"|class(Fit2)[1] == "try-error"|class(Fit3)[1] == "try-error"|class(bic)[1] == "try-error"){
+    
+    if (length(which(Fit < 3)) > 0){
+      Fits[which(Fit < 3)] <- 1
+      Fits[which(Fit >= 3)] <- 0
+      Fits <- as.numeric(Fits)
+      bic <- Inf
+    }else{
+      Fits <- 0
+      bic <- -Inf
+    }
+  }
+  
+
+  if (length(which(Fits > 1)) > 0){
+    Fits[which(Fits > 1)] <- 1
+  }
+  
+  if (length(which(Fit < 3)) > 0){
+    Fits[which(Fit < 3)] <- 1 - Fits[which(Fit < 3)]
+  }
+  
+  options(warn = 0)
+  return(list(Fit1 = Fits[1], Fit2 = Fits[2], Fit3 = Fits[3], Modelres = fit_cfa, BIC = bic))
+}
+
+#Punish Model Complexity
+
+ComPunish <- function(Model, n_factors, n_variables, Punish_rate){
+  if (sum(Model$ModelInd) < n_variables){
+    punish <- 0
+  }else{
+    punish <- Punish_rate*( log(1 + (sum(Model$ModelInd)-n_variables)/((n_factors - 1)*n_variables)))
+  }
+}
+
+
+#function to calculate pheromone
+Pheromone <- function(Model, Data, dicrimination = dicrimination, standards = standards, 
+                      scopes= scopes, BanList, numRuns = 0, LowCut = LowCut, n_factors, n_variables, Punish_rate, Fit){
+  model_estimation <- ModelEst(Model, Data, Fit)
+  BanInd <- FALSE
+  if (model_estimation$Fit1 < 0.80|model_estimation$Fit2 < 0.80|model_estimation$Fit3 < 0.80){
+    BanList <- BanModel(BanList, Model$ModelInd)
+    ph <- 0
+    BanInd <- TRUE
+  }else{
+    ph <- 1
+    for (i in 1:(length(model_estimation)-2)){
+      ph_sub <- (exp((dicrimination[i] * 
+                        (as.numeric(model_estimation[i]) - standards[i])) / scopes[i])) / 
+        (1 + exp((dicrimination[i] * (as.numeric(model_estimation[i]) - standards[i])) / scopes[i]))
+      ph <- ph*ph_sub
+    }
+    ph <- ph - ComPunish(Model = Model, n_factors = n_factors, n_variables = n_variables, Punish_rate = Punish_rate)
+    if (ph < 0){
+      ph <- 0
+    }
+    numRuns <- numRuns + 1
+  }
+  if ((ph < LowCut) & (BanInd == FALSE)){
+    BanList <- BanModel(BanList, Model$ModelInd)
+  }
+  return(list(Pheromone = ph, BanList = BanList, numRuns = numRuns, BIC = model_estimation$BIC))
+}
+
+######################################
+########Function to updata ACC list###
+######################################
+AccModel <- function(AccList, AccInd){
+  if(missing(AccList)){
+    AccList <- NULL
+  }
+  AccList <- c(AccList,paste(AccInd,collapse=""))
+  return(AccList)
+}
+
+####################################################
+##############fuction to update probalitity#########
+ProbCompensation <- function(Model, Pheromone,AccList,probability,n_factors,n_variables,P_dicrimination = P_dicrimination, P_standards = P_standards, P_scopes = P_scopes, HighCut = HighCut){
+  if (Pheromone > HighCut){
+    AccList <- AccModel(AccList, Model$ModelInd)
+    if (length(AccList) > 5){
+      add_rate <- (exp((P_dicrimination * 
+                          (Pheromone - P_standards)) / P_scopes)) / 
+        (1 + exp((P_dicrimination * (Pheromone - P_standards)) / P_scopes))
+      prob_add <- matrix((Model$ModelInd * add_rate / 5), n_factors,n_variables) 
+      prob <- probability + prob_add^20
+      prob[which(prob > 1)] <- 1
+      return(list(Prob = prob, AccList = AccList))
+    }
+    return(list(Prob = probability, AccList = AccList))
+  }else{
+    return(list(Prob = probability, AccList = AccList))
+  }
+}
+
+###################################################
+#####function to update Pheromone level############
+PheLevel <- function(Model, Phe_level = NULL, Pheromone, n_factors,n_variables, probability){
+  if(missing(Phe_level)|is.null(Phe_level)){
+    Phe_level <- rep(0.0001,n_factors*n_variables)
+  }
+  Ind <- Model$ModelInd
+  Phe_level <- Phe_level + Ind*(Pheromone^5)
+  Phe_level[which(t(probability) == 0)] <- 0.0001
+  return(list(PheLevel = Phe_level))
+}
+
+####################################################
+##########calculate entropy#########################
+
+Entropy <- function(Phe_level){
+  entropy <- -sum(Phe_level/sum(Phe_level)*log2(Phe_level/sum(Phe_level)))
+  return(list(Entropy = entropy))
+}
+
+#########################################################################
+######total function for selection for one run###########################
+
+ModelRun <- function(Model,Data,dicrimination,standards, 
+                     scopes= scopes,P_dicrimination, P_standards, P_scopes,
+                     AccList,BanList,Phe_level,probability,n_factors,n_variables, numRuns = 0, LowCut, HighCut, Punish_rate, Fit){
+  
+  pheromone <- Pheromone(Model = Model, Data = Data, dicrimination = dicrimination,standards = standards, 
+                         scopes= scopes, BanList=BanList, numRuns=numRuns, LowCut = LowCut, n_factors = n_factors, n_variables = n_variables, Punish_rate = Punish_rate, Fit = Fit)
+  
+  prob <- ProbCompensation(Model = Model, Pheromone = pheromone$Pheromone,AccList = AccList,probability = probability,n_factors = n_factors, n_variables = n_variables,P_dicrimination = P_dicrimination, 
+                           P_standards = P_standards, P_scopes = P_scopes, HighCut = HighCut)
+  phe_level <- PheLevel(Model=Model, Phe_level=Phe_level, Pheromone = pheromone$Pheromone, n_factors = n_factors, n_variables = n_variables, probability = probability)
+  entropy <- Entropy(Phe_level = phe_level$PheLevel)
+  return(list(PheLevel = phe_level$PheLevel, Prob = prob$Prob, Entropy = entropy$Entropy, NumRuns = pheromone$numRuns, 
+         BanList = pheromone$BanList, AccList = prob$AccList, Pheromone = pheromone$Pheromone, BIC = pheromone$BIC, 
+         ModelInd = paste(Model$ModelInd, collapse = "")))
+}
+
